@@ -5,6 +5,7 @@ import io
 import re
 import time
 import random
+import math
 import pandas as pd
 
 # ── Page config ───────────────────────────────────────────────
@@ -40,17 +41,60 @@ section[data-testid="stSidebar"] * { color: #e2e8f0 !important; }
 }
 .badge-openai { background: #10a37f22; color: #10a37f; border: 1px solid #10a37f55; }
 .badge-gemini { background: #4285f422; color: #4285f4; border: 1px solid #4285f455; }
+.badge-groq   { background: #f5620022; color: #f56200; border: 1px solid #f5620055; }
 .sec-header {
     font-size: 0.7rem; font-weight: 600; letter-spacing: .12em;
     text-transform: uppercase; color: #64748b;
     border-bottom: 1px solid #1e2130; padding-bottom: .4rem; margin: 1.5rem 0 .8rem;
 }
+.cost-box {
+    background: #0f2a1a; border: 1px solid #10a37f44; border-radius: 8px;
+    padding: .75rem 1rem; margin: .5rem 0;
+}
+.cost-box .cost-val { font-size: 1.4rem; font-weight: 700; color: #10a37f; }
+.cost-box .cost-lbl { font-size: 0.8rem; color: #64748b; }
+.error-quota { background:#2a0f0f; border:1px solid #ef444444; border-radius:8px; padding:.75rem 1rem; color:#fca5a5; }
+.error-rate  { background:#2a1f0f; border:1px solid #f97316aa; border-radius:8px; padding:.75rem 1rem; color:#fdba74; }
+.error-auth  { background:#2a1a0f; border:1px solid #eab30844; border-radius:8px; padding:.75rem 1rem; color:#fde68a; }
 </style>
 """, unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════
-# SIDEBAR — Provider selection & keys
+# CONSTANTS
+# ═══════════════════════════════════════════════════════════════
+
+# Pricing per 1K tokens (input, output) in USD. Groq free tier = $0.
+PRICING = {
+    # OpenAI
+    "gpt-4o-mini":          (0.00015,  0.00060),
+    "gpt-4o":               (0.00500,  0.01500),
+    "gpt-4-turbo":          (0.01000,  0.03000),
+    "gpt-3.5-turbo":        (0.00050,  0.00150),
+    # Gemini
+    "gemini-2.5-flash":     (0.000075, 0.00030),
+    "gemini-2.5-flash-lite":(0.000025, 0.00010),
+    "gemma-3-27b":          (0.0,      0.0),
+    "gemini-3-flash":       (0.000075, 0.00030),
+    # Groq — free tier (pay-as-you-go is very cheap, treat as ~$0 for free users)
+    "llama-3.3-70b-versatile":       (0.0, 0.0),
+    "llama-3.1-8b-instant":          (0.0, 0.0),
+    "mixtral-8x7b-32768":            (0.0, 0.0),
+    "gemma2-9b-it":                  (0.0, 0.0),
+}
+
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",   # best quality on Groq
+    "llama-3.1-8b-instant",      # fastest
+    "mixtral-8x7b-32768",        # large context
+    "gemma2-9b-it",              # Google Gemma via Groq
+]
+
+BATCH_SIZE = 20  # chats per re-label call
+
+
+# ═══════════════════════════════════════════════════════════════
+# SIDEBAR
 # ═══════════════════════════════════════════════════════════════
 
 def _get_secret(key: str) -> str:
@@ -62,53 +106,59 @@ def _get_secret(key: str) -> str:
 
 with st.sidebar:
     st.markdown("### 🤖 AI Provider")
-    provider = st.radio("Choose provider", ["OpenAI", "Gemini"], horizontal=True)
-
+    provider = st.radio("Choose provider", ["Groq", "OpenAI", "Gemini"], horizontal=True,
+                        help="Groq is free-tier friendly with fast inference. OpenAI is most reliable. Gemini has rate limits.")
     st.markdown("---")
 
-    if provider == "OpenAI":
+    # ── Groq ──────────────────────────────────────────────────
+    if provider == "Groq":
+        st.markdown("### 🔑 Groq API Key")
+        _groq_secret = _get_secret("GROQ_API_KEY")
+        if _groq_secret:
+            st.success("🔒 Key loaded from Streamlit Secrets")
+            api_key = _groq_secret
+        else:
+            api_key = st.text_input("Paste your key", type="password", placeholder="gsk_...",
+                                    help="Get a free key at console.groq.com. Set GROQ_API_KEY in Streamlit Secrets.")
+        st.markdown("### ⚙️ Model")
+        model_name = st.selectbox("Groq model", GROQ_MODELS,
+                                  help="llama-3.3-70b-versatile gives best results. llama-3.1-8b-instant is fastest.")
+        st.info("💡 Groq free tier is generous — great for testing with no billing needed.")
+
+    # ── OpenAI ────────────────────────────────────────────────
+    elif provider == "OpenAI":
         st.markdown("### 🔑 OpenAI API Key")
         _oai_secret = _get_secret("OPENAI_API_KEY")
         if _oai_secret:
             st.success("🔒 Key loaded from Streamlit Secrets")
             api_key = _oai_secret
         else:
-            api_key = st.text_input(
-                "Paste your key", type="password", placeholder="sk-...",
-                help="Or set OPENAI_API_KEY in Streamlit Cloud Secrets."
-            )
+            api_key = st.text_input("Paste your key", type="password", placeholder="sk-...",
+                                    help="Set OPENAI_API_KEY in Streamlit Cloud Secrets.")
         st.markdown("### ⚙️ Model")
-        model_name = st.selectbox("OpenAI model", [
-            "gpt-4o-mini",
-            "gpt-4o",
-            "gpt-4-turbo",
-            "gpt-3.5-turbo",
-        ])
+        model_name = st.selectbox("OpenAI model", ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
+                                  help="gpt-4o-mini is cheapest — costs under $0.01 for 100 chats.")
 
-    else:  # Gemini
+    # ── Gemini ────────────────────────────────────────────────
+    else:
         st.markdown("### 🔑 Gemini API Key")
         _gem_secret = _get_secret("GEMINI_API_KEY")
         if _gem_secret:
             st.success("🔒 Key loaded from Streamlit Secrets")
             api_key = _gem_secret
         else:
-            api_key = st.text_input(
-                "Paste your key", type="password", placeholder="AIza...",
-                help="Or set GEMINI_API_KEY in Streamlit Cloud Secrets."
-            )
+            api_key = st.text_input("Paste your key", type="password", placeholder="AIza...",
+                                    help="Set GEMINI_API_KEY in Streamlit Cloud Secrets.")
         st.markdown("### ⚙️ Model")
-        model_name = st.selectbox("Gemini model", [
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
-            "gemma-3-27b",
-            "gemini-3-flash",
-        ])
+        model_name = st.selectbox("Gemini model",
+                                  ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemma-3-27b", "gemini-3-flash"])
+        st.warning("⚠️ Gemini free tier has strict rate limits. Use Groq or OpenAI if hitting errors.")
 
     st.markdown("---")
     st.markdown("### 📊 Analysis Settings")
     sample_size = st.slider(
-        "Chats to analyse (sample)", min_value=10, max_value=500, value=100, step=10,
-        help="How many chats the AI reads to build the schema."
+        "Chats to analyse (sample)", 10, 500, 50, 10,
+        help="50–100 chats is enough for a good schema. More doesn't improve quality, just costs more."
     )
     st.markdown("---")
     st.markdown("### ℹ️ About")
@@ -119,11 +169,9 @@ with st.sidebar:
 
 
 # ── Header ────────────────────────────────────────────────────
-badge_html = (
-    '<span class="provider-badge badge-openai">OpenAI</span>'
-    if provider == "OpenAI" else
-    '<span class="provider-badge badge-gemini">Gemini</span>'
-)
+badge_class = {"OpenAI": "badge-openai", "Gemini": "badge-gemini", "Groq": "badge-groq"}[provider]
+badge_html = f'<span class="provider-badge {badge_class}">{provider}</span>'
+
 st.markdown(f"""
 <div class="app-header">
   <div>
@@ -135,12 +183,51 @@ st.markdown(f"""
 
 
 # ═══════════════════════════════════════════════════════════════
-# AI CALL ABSTRACTION
+# TOKEN & COST UTILITIES
+# ═══════════════════════════════════════════════════════════════
+
+def estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+def estimate_cost(input_tokens: int, output_tokens: int, model: str) -> float:
+    in_rate, out_rate = PRICING.get(model, (0.001, 0.002))
+    return (input_tokens / 1000 * in_rate) + (output_tokens / 1000 * out_rate)
+
+def format_cost(usd: float) -> str:
+    if usd < 0.0001:
+        return "FREE / < $0.0001"
+    if usd < 0.01:
+        return f"${usd:.4f}"
+    return f"${usd:.3f}"
+
+
+# ═══════════════════════════════════════════════════════════════
+# AI CALL ABSTRACTION — OpenAI / Groq share the same client
+# (Groq is OpenAI-compatible, just different base_url + no json_object mode)
 # ═══════════════════════════════════════════════════════════════
 
 def call_ai(prompt: str, max_tokens: int = 8192, temperature: float = 0.2) -> str:
-    """Call the selected provider and return raw text."""
-    if provider == "OpenAI":
+    """Unified AI call. Returns raw text response."""
+
+    # ── Groq (OpenAI-compatible SDK, different base URL) ──────
+    if provider == "Groq":
+        from openai import OpenAI
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1",
+        )
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            # Note: Groq doesn't support response_format json_object on all models,
+            # so we rely on prompt instruction + parse_json_response cleaning instead
+        )
+        return response.choices[0].message.content
+
+    # ── OpenAI ────────────────────────────────────────────────
+    elif provider == "OpenAI":
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
         response = client.chat.completions.create(
@@ -152,7 +239,8 @@ def call_ai(prompt: str, max_tokens: int = 8192, temperature: float = 0.2) -> st
         )
         return response.choices[0].message.content
 
-    else:  # Gemini
+    # ── Gemini ────────────────────────────────────────────────
+    else:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(model_name)
@@ -166,19 +254,46 @@ def call_ai(prompt: str, max_tokens: int = 8192, temperature: float = 0.2) -> st
         return response.text
 
 
-def parse_json_response(raw: str) -> dict:
+def parse_json_response(raw: str) -> dict | list:
+    """Strip markdown fences and parse JSON — handles both dict and list responses."""
     raw = raw.strip()
     raw = re.sub(r"^```json\s*", "", raw)
     raw = re.sub(r"^```\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
+    # Some models wrap arrays: {"results": [...]} — unwrap if needed downstream
     return json.loads(raw)
 
 
+def friendly_error(e: Exception) -> tuple[str, str]:
+    msg = str(e)
+    if "insufficient_quota" in msg or ("429" in msg and "quota" in msg.lower()):
+        return "error-quota", (
+            "🚫 **Quota exceeded** — your OpenAI account has no credit balance.  \n"
+            "**Fix:** Go to [platform.openai.com/billing](https://platform.openai.com/billing) "
+            "and add at least $5. Running 100 chats costs under **$0.01** with gpt-4o-mini.  \n"
+            "**Or switch to Groq** — it's free."
+        )
+    if "rate_limit" in msg or ("429" in msg and "rate" in msg.lower()):
+        return "error-rate", (
+            "⏱️ **Rate limit hit** — too many requests too fast.  \n"
+            "**Fix:** Wait 30–60 seconds and retry, or lower the sample size. "
+            "**Groq** has much more generous rate limits than Gemini."
+        )
+    if "invalid_api_key" in msg or "401" in msg or "403" in msg:
+        return "error-auth", (
+            "🔑 **Invalid API key** — the key was rejected.  \n"
+            "**Fix:** Check the key starts with `sk-` (OpenAI), `AIza` (Gemini), or `gsk_` (Groq). "
+            "Make sure you copied the full key with no trailing spaces."
+        )
+    return "error-quota", f"**Unexpected error:** `{msg}`"
+
+
 # ═══════════════════════════════════════════════════════════════
-# HELPERS
+# CHAT HELPERS
 # ═══════════════════════════════════════════════════════════════
 
 def extract_jsons_from_zip(uploaded_file) -> list[dict]:
+    """Recursively unpack nested ZIPs and collect all JSON objects."""
     results = []
 
     def _process(zip_bytes: bytes, depth: int = 0):
@@ -206,72 +321,70 @@ def extract_jsons_from_zip(uploaded_file) -> list[dict]:
     return results
 
 
-def flatten_chat(chat: dict) -> str:
+def flatten_chat(chat: dict, max_chars: int = 600) -> str:
+    """Flatten a tawk.to chat dict to a compact readable string."""
     lines = []
     if chat.get("id"):
-        lines.append(f"[ID: {chat['id']}]")
+        lines.append(f"[{chat['id']}]")
     messages = chat.get("messages", chat.get("conversation", []))
     for msg in messages:
         sender = msg.get("name") or msg.get("sender") or msg.get("type", "?")
         text = msg.get("msg") or msg.get("message") or msg.get("text", "")
         if text:
-            lines.append(f"{sender}: {text}")
+            lines.append(f"{sender}: {text[:200]}")
     if len(lines) <= 1:
-        lines.append(json.dumps(chat, ensure_ascii=False)[:800])
-    return "\n".join(lines)
+        lines.append(json.dumps(chat, ensure_ascii=False)[:max_chars])
+    return "\n".join(lines)[:max_chars]
 
+
+# ═══════════════════════════════════════════════════════════════
+# PROMPTS
+# ═══════════════════════════════════════════════════════════════
 
 def build_schema_prompt(chat_samples: list[str]) -> str:
-    sample_block = "\n\n---CHAT---\n".join(chat_samples[:200])
-    return f"""
-You are an expert customer support analyst at a web hosting company (HostAfrica).
-You have been given a sample of live support chat transcripts.
+    trimmed = [s[:500] for s in chat_samples]
+    sample_block = "\n---\n".join(trimmed)[:80_000]
+    return f"""You are an expert customer support analyst at HostAfrica (web hosting company).
+Analyse the support chat sample below and produce a CLEAN, DATA-DRIVEN categorisation schema.
 
-YOUR TASK:
-Analyse these chats and produce a CLEAN, DATA-DRIVEN issue categorisation schema.
-
-STRICT RULES:
-1. Categories must reflect genuine customer problems — NOT internal procedures.
-   - "Support PIN" / "security PIN" is a ROUTINE authentication step at the START
-     of nearly every chat. It is NOT a customer issue. Do NOT create a category for it.
-   - Do not create categories for agent greetings, closing pleasantries, or any scripted steps.
-2. Create 10–22 categories maximum. Merge thin or overlapping categories.
-3. Each category object must contain:
+RULES:
+1. Categories = genuine customer problems ONLY. NOT internal procedures.
+   - Support PIN / security PIN = routine auth step performed at the start of almost every chat.
+     It is NOT a customer issue. Do NOT create a category for it.
+   - No categories for greetings, farewells, or scripted agent steps.
+2. 10–20 categories max. Merge thin or overlapping ones.
+3. Each category must have:
    - "name": short clear title (e.g. "Email Delivery Failures")
    - "description": 1–2 sentences on what belongs here
-   - "signals": list of 8–20 lowercase keyword/phrase triggers
-   - "exclude": list of 3–8 phrases that look similar but must NOT trigger this category
-   - "example_intents": 2–3 verbatim-style example sentences a customer might say
-4. Return a top-level "meta" object containing:
+   - "signals": 8–20 lowercase keyword/phrase triggers
+   - "exclude": 3–8 false-positive phrases to ignore
+   - "example_intents": 2–3 example sentences a customer might say
+4. Include a "meta" object with:
    - "schema_version": "1.0"
    - "derived_from_sample_size": {len(chat_samples)}
-   - "analyst_notes": paragraph explaining dominant patterns and what the old
-     keyword-matching approach was getting wrong
+   - "analyst_notes": paragraph on dominant patterns and what the old keyword approach got wrong
 
-Return ONLY a valid JSON object with keys "categories" and "meta". No preamble, no markdown fences.
+Return ONLY valid JSON with keys "categories" and "meta". No markdown, no preamble.
 
 === CHAT SAMPLE ===
----CHAT---
-{sample_block}
-"""
+{sample_block}"""
 
 
-def build_relabelling_prompt(schema: dict, chat_text: str) -> str:
-    categories = [c["name"] for c in schema.get("categories", [])]
+def build_batch_relabel_prompt(schema: dict, chat_batch: list[tuple[int, str]]) -> str:
+    """Classify multiple chats in one API call — ~80% cheaper than one-per-chat."""
+    categories = [c["name"] for c in schema.get("categories", [])] + ["General"]
     cat_list = "\n".join(f"- {c}" for c in categories)
-    return f"""
-You are a support chat classifier. Use ONLY the categories listed below.
+    chats_block = "\n".join(f"[CHAT_{idx}]\n{text[:400]}" for idx, text in chat_batch)
 
-AVAILABLE CATEGORIES:
+    return f"""Classify each chat below using ONLY these categories:
 {cat_list}
-- General (only if nothing else matches)
 
-CHAT:
-{chat_text[:1500]}
+Return a JSON array with exactly {len(chat_batch)} objects.
+Each object: {{"id": <chat index 0-based>, "category": "<name>", "confidence": <0.0-1.0>, "reason": "<one sentence>"}}
 
-Return ONLY valid JSON:
-{{"category": "<category name>", "confidence": <0.0-1.0>, "reason": "<one sentence>"}}
-"""
+Return ONLY a valid JSON array. No preamble, no markdown.
+
+{chats_block}"""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -282,14 +395,15 @@ tab1, tab2, tab3 = st.tabs(["📤 Upload & Extract", "🧠 Build Schema", "🏷�
 
 
 # ──────────────────────────────────────────────────────────────
-# TAB 1 — Upload
+# TAB 1 — Upload & Extract
 # ──────────────────────────────────────────────────────────────
 with tab1:
     st.markdown('<div class="sec-header">Upload your tawk.to ZIP export</div>', unsafe_allow_html=True)
 
     uploaded = st.file_uploader(
-        "Drop a ZIP file here (nested ZIPs handled automatically)",
+        "Drop a ZIP file here — nested ZIPs are handled automatically",
         type=["zip"],
+        help="The app recursively unpacks every nested ZIP and collects all JSON files."
     )
 
     if uploaded:
@@ -300,7 +414,6 @@ with tab1:
             st.error("No JSON chat records found. Double-check the ZIP structure.")
         else:
             st.session_state["chats"] = chats
-
             msg_count = sum(len(c.get("messages", c.get("conversation", []))) for c in chats)
             agents = {
                 m.get("name", "")
@@ -308,6 +421,7 @@ with tab1:
                 for m in c.get("messages", c.get("conversation", []))
                 if m.get("type") in ("agent", "staff")
             }
+
             col1, col2, col3, col4 = st.columns(4)
             for col, val, lbl in [
                 (col1, f"{len(chats):,}", "Chats Found"),
@@ -342,24 +456,40 @@ with tab2:
     else:
         chats = st.session_state["chats"]
         n = min(sample_size, len(chats))
-        st.markdown(
-            f"**{provider} · {model_name}** will analyse **{n}** of your **{len(chats):,}** chats "
-            f"and produce a clean schema. PIN verification and procedural steps will be excluded."
-        )
+
+        # Live cost estimate
+        sample_preview = random.sample(chats, n)
+        flat_preview = [flatten_chat(c) for c in sample_preview]
+        prompt_preview = build_schema_prompt(flat_preview)
+        est_in  = estimate_tokens(prompt_preview)
+        est_out = 3000
+        est_cost = estimate_cost(est_in, est_out, model_name)
+
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.markdown(f'<div class="cost-box"><div class="cost-val">{n}</div>'
+                        f'<div class="cost-lbl">Chats in sample</div></div>', unsafe_allow_html=True)
+        with col_b:
+            st.markdown(f'<div class="cost-box"><div class="cost-val">~{est_in:,}</div>'
+                        f'<div class="cost-lbl">Estimated input tokens</div></div>', unsafe_allow_html=True)
+        with col_c:
+            st.markdown(f'<div class="cost-box"><div class="cost-val">{format_cost(est_cost)}</div>'
+                        f'<div class="cost-lbl">Estimated cost (USD)</div></div>', unsafe_allow_html=True)
+
+        st.caption(f"Using **{provider} · {model_name}**. Adjust sample size in the sidebar to control cost.")
+        st.markdown("---")
 
         if st.button("🚀 Build Schema", type="primary", use_container_width=True):
-            sample = random.sample(chats, n)
-            with st.spinner("💬 Flattening transcripts…"):
-                flat_samples = [flatten_chat(c) for c in sample]
-
-            prompt = build_schema_prompt(flat_samples)
+            prompt = build_schema_prompt(flat_preview)
             progress = st.progress(0, f"Sending {n} chats to {provider}…")
-
+            raw = ""
             try:
-                progress.progress(25, f"{provider} is reading the chats…")
-                raw = call_ai(prompt, max_tokens=8192, temperature=0.2)
+                progress.progress(25, f"{provider} is analysing the chats…")
+                raw = call_ai(prompt, max_tokens=4096, temperature=0.2)
                 progress.progress(80, "Parsing response…")
                 schema = parse_json_response(raw)
+                if not isinstance(schema, dict) or "categories" not in schema:
+                    raise ValueError("Response missing 'categories' key.")
                 st.session_state["schema"] = schema
                 progress.progress(100, "Done!")
                 time.sleep(0.3)
@@ -373,13 +503,14 @@ with tab2:
                     st.code(raw)
             except Exception as e:
                 progress.empty()
-                st.error(f"{provider} error: {e}")
+                css_cls, msg = friendly_error(e)
+                st.markdown(f'<div class="{css_cls}">{msg}</div>', unsafe_allow_html=True)
 
+        # Display schema
         if "schema" in st.session_state:
             schema = st.session_state["schema"]
             categories = schema.get("categories", [])
             meta = schema.get("meta", {})
-
             st.markdown("---")
 
             if meta:
@@ -391,7 +522,6 @@ with tab2:
                     )
 
             st.markdown(f"### 📂 {len(categories)} Categories Identified")
-
             for cat in categories:
                 with st.expander(f"**{cat.get('name')}**"):
                     st.markdown(f"**Description:** {cat.get('description','')}")
@@ -436,7 +566,7 @@ with tab2:
 
 
 # ──────────────────────────────────────────────────────────────
-# TAB 3 — Re-label chats
+# TAB 3 — Re-label (batched)
 # ──────────────────────────────────────────────────────────────
 with tab3:
     st.markdown('<div class="sec-header">Re-label your chats using the new schema</div>', unsafe_allow_html=True)
@@ -453,46 +583,98 @@ with tab3:
 
         relabel_count = st.slider(
             "How many chats to re-label?",
-            min_value=5, max_value=min(200, len(chats)), value=min(50, len(chats))
+            min_value=5, max_value=min(500, len(chats)), value=min(100, len(chats))
         )
 
-        if provider == "OpenAI":
-            hint = f"gpt-4o-mini recommended for cost. ~{relabel_count * 2}–{relabel_count * 3}s"
-        else:
-            hint = f"Flash models are fastest. ~{relabel_count * 2}–{relabel_count * 4}s. Watch rate limits."
-        st.info(f"⚡ {relabel_count} API calls · {hint}")
+        # Batched cost estimate
+        n_batches = math.ceil(relabel_count / BATCH_SIZE)
+        sample_rl = random.sample(chats, min(BATCH_SIZE, relabel_count))
+        flat_rl = [(i, flatten_chat(c)) for i, c in enumerate(sample_rl)]
+        batch_ex = build_batch_relabel_prompt(schema, flat_rl)
+        tpb = estimate_tokens(batch_ex)
+        total_in  = tpb * n_batches
+        total_out = 150 * n_batches
+        cost_rl = estimate_cost(total_in, total_out, model_name)
+
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.markdown(f'<div class="cost-box"><div class="cost-val">{n_batches}</div>'
+                        f'<div class="cost-lbl">API calls (batched {BATCH_SIZE}/call)</div></div>',
+                        unsafe_allow_html=True)
+        with col_b:
+            st.markdown(f'<div class="cost-box"><div class="cost-val">~{total_in:,}</div>'
+                        f'<div class="cost-lbl">Estimated input tokens</div></div>', unsafe_allow_html=True)
+        with col_c:
+            st.markdown(f'<div class="cost-box"><div class="cost-val">{format_cost(cost_rl)}</div>'
+                        f'<div class="cost-lbl">Estimated cost (USD)</div></div>', unsafe_allow_html=True)
+
+        st.caption(f"✅ Batching {BATCH_SIZE} chats per call — ~80% cheaper than one-per-chat.")
 
         if st.button("🏷️ Re-label Chats", type="primary", use_container_width=True):
             sample = random.sample(chats, relabel_count)
+            indexed = [(i, flatten_chat(c)) for i, c in enumerate(sample)]
+            batches = [indexed[i:i + BATCH_SIZE] for i in range(0, len(indexed), BATCH_SIZE)]
+
             results = []
             progress = st.progress(0, "Starting…")
+            errors = 0
 
-            for i, chat in enumerate(sample):
-                progress.progress((i + 1) / relabel_count, f"Classifying chat {i+1}/{relabel_count}…")
-                flat = flatten_chat(chat)
-                prompt = build_relabelling_prompt(schema, flat)
-
+            for b_idx, batch in enumerate(batches):
+                progress.progress(
+                    (b_idx + 1) / len(batches),
+                    f"Batch {b_idx+1}/{len(batches)} — classifying {len(batch)} chats…"
+                )
+                prompt = build_batch_relabel_prompt(schema, batch)
+                raw_clean = ""
                 try:
-                    raw = call_ai(prompt, max_tokens=256, temperature=0.1)
-                    result = parse_json_response(raw)
-                    result["chat_id"] = chat.get("id", i)
-                    result["preview"] = flat[:150]
-                    results.append(result)
-                except Exception as e:
-                    results.append({
-                        "chat_id": chat.get("id", i),
-                        "category": "Error",
-                        "confidence": 0,
-                        "reason": str(e),
-                        "preview": "",
-                    })
+                    raw = call_ai(prompt, max_tokens=1024, temperature=0.1)
+                    raw_clean = raw.strip()
+                    raw_clean = re.sub(r"^```json\s*", "", raw_clean)
+                    raw_clean = re.sub(r"^```\s*", "", raw_clean)
+                    raw_clean = re.sub(r"\s*```$", "", raw_clean)
 
-                if provider == "Gemini":
-                    time.sleep(0.3)  # gentle rate-limit buffer
+                    batch_results = json.loads(raw_clean)
+
+                    # Unwrap if model returned {"results": [...]} instead of [...]
+                    if isinstance(batch_results, dict):
+                        batch_results = next(
+                            (v for v in batch_results.values() if isinstance(v, list)), []
+                        )
+
+                    for item in batch_results:
+                        orig_idx = item.get("id", 0)
+                        if 0 <= orig_idx < len(batch):
+                            chat_obj = sample[batch[orig_idx][0]]
+                            results.append({
+                                "chat_id":    chat_obj.get("id", batch[orig_idx][0]),
+                                "category":   item.get("category", "General"),
+                                "confidence": round(float(item.get("confidence", 0)), 2),
+                                "reason":     item.get("reason", ""),
+                                "preview":    batch[orig_idx][1][:150],
+                            })
+
+                except Exception as e:
+                    errors += 1
+                    css_cls, msg = friendly_error(e)
+                    st.markdown(
+                        f'<div class="{css_cls}">Batch {b_idx+1} failed: {msg}</div>',
+                        unsafe_allow_html=True
+                    )
+                    if "quota" in str(e).lower() or "insufficient" in str(e).lower():
+                        break  # stop if quota is exhausted
+
+                # Groq & Gemini benefit from a small pause between batches
+                if provider in ("Gemini", "Groq"):
+                    time.sleep(0.4)
 
             progress.empty()
-            st.session_state["relabelled"] = results
-            st.success(f"✅ Classified {len(results)} chats!")
+
+            if results:
+                st.session_state["relabelled"] = results
+                msg_suffix = f" ({errors} batch(es) failed)" if errors else ""
+                st.success(f"✅ Classified {len(results)} chats{msg_suffix}")
+            else:
+                st.error("No chats were classified. Check the error messages above.")
 
         if "relabelled" in st.session_state:
             results = st.session_state["relabelled"]
