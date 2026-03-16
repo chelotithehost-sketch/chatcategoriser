@@ -67,11 +67,23 @@ section[data-testid="stSidebar"] * { color: #e2e8f0 !important; }
 </style>
 """, unsafe_allow_html=True)
 
+# ── API Key — secrets first, sidebar fallback ─────────────────
+_secret_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
+
 # ── Sidebar ───────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 🔑 Gemini API Key")
-    api_key = st.text_input("Paste your key", type="password", placeholder="AIza...")
-    
+    if _secret_key:
+        st.success("🔒 Key loaded from Streamlit Secrets")
+        api_key = _secret_key
+    else:
+        api_key = st.text_input(
+            "Paste your key",
+            type="password",
+            placeholder="AIza...",
+            help="Or set GEMINI_API_KEY in Streamlit Cloud Secrets to avoid entering it here."
+        )
+
     st.markdown("---")
     st.markdown("### ⚙️ Model Settings")
     model_name = st.selectbox("Gemini model", [
