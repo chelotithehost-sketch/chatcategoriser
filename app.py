@@ -87,10 +87,10 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### ⚙️ Model Settings")
     model_name = st.selectbox("Gemini model", [
-        "gemma-3-27b",
-        "gemini-2.5-flash-lite",
+        "gemini-3.1-pro-preview",
+        "gemini-3-pro",
         "gemini-2.5-flash",
-        "gemini-3-flash",
+        "gemini-3.1-flash-lite",
     ])
     sample_size = st.slider(
         "Chats to analyse (sample)",
