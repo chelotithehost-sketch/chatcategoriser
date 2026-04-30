@@ -7,10 +7,11 @@ import time
 import random
 import math
 import pandas as pd
+from collections import Counter
 
 # ── Page config ───────────────────────────────────────────────
 st.set_page_config(
-    page_title="Chat Categoriser · HostAfrica",
+    page_title="Chat Categoriser",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -64,9 +65,8 @@ section[data-testid="stSidebar"] * { color: #e2e8f0 !important; }
 # CONSTANTS
 # ═══════════════════════════════════════════════════════════════
 
-# Pricing per 1K tokens (input, output) in USD. Groq free tier = $0.
 PRICING = {
-    # OpenAI
+    # OpenAI (per 1K tokens)
     "gpt-4o-mini":          (0.00015,  0.00060),
     "gpt-4o":               (0.00500,  0.01500),
     "gpt-4-turbo":          (0.01000,  0.03000),
@@ -76,7 +76,7 @@ PRICING = {
     "gemini-2.5-flash-lite":(0.000025, 0.00010),
     "gemma-3-27b":          (0.0,      0.0),
     "gemini-3-flash":       (0.000075, 0.00030),
-    # Groq — free tier (pay-as-you-go is very cheap, treat as ~$0 for free users)
+    # Groq free tier
     "llama-3.3-70b-versatile":       (0.0, 0.0),
     "llama-3.1-8b-instant":          (0.0, 0.0),
     "mixtral-8x7b-32768":            (0.0, 0.0),
@@ -84,13 +84,13 @@ PRICING = {
 }
 
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",   # best quality on Groq
-    "llama-3.1-8b-instant",      # fastest
-    "mixtral-8x7b-32768",        # large context
-    "gemma2-9b-it",              # Google Gemma via Groq
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
 ]
 
-BATCH_SIZE = 20  # chats per re-label call
+BATCH_SIZE = 20
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -107,10 +107,9 @@ def _get_secret(key: str) -> str:
 with st.sidebar:
     st.markdown("### 🤖 AI Provider")
     provider = st.radio("Choose provider", ["Groq", "OpenAI", "Gemini"], horizontal=True,
-                        help="Groq is free-tier friendly with fast inference. OpenAI is most reliable. Gemini has rate limits.")
+                        help="Groq is free-tier friendly. OpenAI is most reliable. Gemini has rate limits.")
     st.markdown("---")
 
-    # ── Groq ──────────────────────────────────────────────────
     if provider == "Groq":
         st.markdown("### 🔑 Groq API Key")
         _groq_secret = _get_secret("GROQ_API_KEY")
@@ -119,13 +118,12 @@ with st.sidebar:
             api_key = _groq_secret
         else:
             api_key = st.text_input("Paste your key", type="password", placeholder="gsk_...",
-                                    help="Get a free key at console.groq.com. Set GROQ_API_KEY in Streamlit Secrets.")
+                                    help="Get a free key at console.groq.com")
         st.markdown("### ⚙️ Model")
         model_name = st.selectbox("Groq model", GROQ_MODELS,
-                                  help="llama-3.3-70b-versatile gives best results. llama-3.1-8b-instant is fastest.")
-        st.info("💡 Groq free tier is generous — great for testing with no billing needed.")
+                                  help="llama-3.3-70b-versatile gives best results.")
+        st.info("💡 Groq free tier is generous — great for testing.")
 
-    # ── OpenAI ────────────────────────────────────────────────
     elif provider == "OpenAI":
         st.markdown("### 🔑 OpenAI API Key")
         _oai_secret = _get_secret("OPENAI_API_KEY")
@@ -137,9 +135,8 @@ with st.sidebar:
                                     help="Set OPENAI_API_KEY in Streamlit Cloud Secrets.")
         st.markdown("### ⚙️ Model")
         model_name = st.selectbox("OpenAI model", ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
-                                  help="gpt-4o-mini is cheapest — costs under $0.01 for 100 chats.")
+                                  help="gpt-4o-mini is cheapest — under $0.01 for 100 chats.")
 
-    # ── Gemini ────────────────────────────────────────────────
     else:
         st.markdown("### 🔑 Gemini API Key")
         _gem_secret = _get_secret("GEMINI_API_KEY")
@@ -152,13 +149,17 @@ with st.sidebar:
         st.markdown("### ⚙️ Model")
         model_name = st.selectbox("Gemini model",
                                   ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemma-3-27b", "gemini-3-flash"])
-        st.warning("⚠️ Gemini free tier has strict rate limits. Use Groq or OpenAI if hitting errors.")
+        st.warning("⚠️ Gemini free tier has strict rate limits.")
 
     st.markdown("---")
     st.markdown("### 📊 Analysis Settings")
     sample_size = st.slider(
         "Chats to analyse (sample)", 10, 500, 50, 10,
-        help="50–100 chats is enough for a good schema. More doesn't improve quality, just costs more."
+        help="50–100 chats is enough for a good schema."
+    )
+    min_messages = st.slider(
+        "Min messages per chat", 1, 10, 2, 1,
+        help="Filter out very short chats (e.g. visitor left immediately)."
     )
     st.markdown("---")
     st.markdown("### ℹ️ About")
@@ -187,7 +188,8 @@ st.markdown(f"""
 # ═══════════════════════════════════════════════════════════════
 
 def estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
+    """Better estimation: ~3.5 chars per token for English mixed with code/URLs."""
+    return max(1, int(len(text) / 3.5))
 
 def estimate_cost(input_tokens: int, output_tokens: int, model: str) -> float:
     in_rate, out_rate = PRICING.get(model, (0.001, 0.002))
@@ -202,31 +204,23 @@ def format_cost(usd: float) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-# AI CALL ABSTRACTION — OpenAI / Groq share the same client
-# (Groq is OpenAI-compatible, just different base_url + no json_object mode)
+# AI CALL ABSTRACTION
 # ═══════════════════════════════════════════════════════════════
 
 def call_ai(prompt: str, max_tokens: int = 8192, temperature: float = 0.2) -> str:
     """Unified AI call. Returns raw text response."""
 
-    # ── Groq (OpenAI-compatible SDK, different base URL) ──────
     if provider == "Groq":
         from openai import OpenAI
-        client = OpenAI(
-            api_key=api_key,
-            base_url="https://api.groq.com/openai/v1",
-        )
+        client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
         response = client.chat.completions.create(
             model=model_name,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
             temperature=temperature,
-            # Note: Groq doesn't support response_format json_object on all models,
-            # so we rely on prompt instruction + parse_json_response cleaning instead
         )
         return response.choices[0].message.content
 
-    # ── OpenAI ────────────────────────────────────────────────
     elif provider == "OpenAI":
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
@@ -235,11 +229,10 @@ def call_ai(prompt: str, max_tokens: int = 8192, temperature: float = 0.2) -> st
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
             temperature=temperature,
-            response_format={"type": "json_object"},  # enforces valid JSON
+            response_format={"type": "json_object"},
         )
         return response.choices[0].message.content
 
-    # ── Gemini ────────────────────────────────────────────────
     else:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
@@ -255,12 +248,11 @@ def call_ai(prompt: str, max_tokens: int = 8192, temperature: float = 0.2) -> st
 
 
 def parse_json_response(raw: str) -> dict | list:
-    """Strip markdown fences and parse JSON — handles both dict and list responses."""
+    """Strip markdown fences and parse JSON — handles both dict and list."""
     raw = raw.strip()
     raw = re.sub(r"^```json\s*", "", raw)
     raw = re.sub(r"^```\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
-    # Some models wrap arrays: {"results": [...]} — unwrap if needed downstream
     return json.loads(raw)
 
 
@@ -268,29 +260,53 @@ def friendly_error(e: Exception) -> tuple[str, str]:
     msg = str(e)
     if "insufficient_quota" in msg or ("429" in msg and "quota" in msg.lower()):
         return "error-quota", (
-            "🚫 **Quota exceeded** — your OpenAI account has no credit balance.  \n"
-            "**Fix:** Go to [platform.openai.com/billing](https://platform.openai.com/billing) "
-            "and add at least $5. Running 100 chats costs under **$0.01** with gpt-4o-mini.  \n"
-            "**Or switch to Groq** — it's free."
+            "🚫 **Quota exceeded** — add credit at your provider's billing page, "
+            "or **switch to Groq** (free)."
         )
     if "rate_limit" in msg or ("429" in msg and "rate" in msg.lower()):
         return "error-rate", (
-            "⏱️ **Rate limit hit** — too many requests too fast.  \n"
-            "**Fix:** Wait 30–60 seconds and retry, or lower the sample size. "
-            "**Groq** has much more generous rate limits than Gemini."
+            "⏱️ **Rate limit hit** — wait 30–60 seconds and retry, or lower the sample size."
         )
     if "invalid_api_key" in msg or "401" in msg or "403" in msg:
         return "error-auth", (
-            "🔑 **Invalid API key** — the key was rejected.  \n"
-            "**Fix:** Check the key starts with `sk-` (OpenAI), `AIza` (Gemini), or `gsk_` (Groq). "
-            "Make sure you copied the full key with no trailing spaces."
+            "🔑 **Invalid API key** — check the key and try again."
         )
     return "error-quota", f"**Unexpected error:** `{msg}`"
 
 
 # ═══════════════════════════════════════════════════════════════
-# CHAT HELPERS
+# CHAT HELPERS — tawk.to format aware
 # ═══════════════════════════════════════════════════════════════
+
+def _sender_label(msg: dict) -> str:
+    """Extract human-readable sender name from tawk.to message format.
+
+    tawk.to uses: sender: {t: "a"|"v"|"s", n: "Name"}
+      t="a" → agent, t="v" → visitor, t="s" → system
+    """
+    sender = msg.get("sender", {})
+    if isinstance(sender, dict):
+        stype = sender.get("t", "")
+        name = sender.get("n", "")
+        if stype == "v":
+            return name or "Visitor"
+        if stype == "a":
+            return name or "Agent"
+        if stype == "s":
+            return "System"
+    # Fallback for non-tawk formats
+    if isinstance(sender, str):
+        return sender
+    return msg.get("name") or msg.get("type", "?")
+
+
+def _msg_text(msg: dict) -> str:
+    """Extract message text, handling tawk.to format."""
+    text = msg.get("msg") or msg.get("message") or msg.get("text") or ""
+    # Strip markdown bold markers that agents sometimes use
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    return text.strip()
+
 
 def extract_jsons_from_zip(uploaded_file) -> list[dict]:
     """Recursively unpack nested ZIPs and collect all JSON objects."""
@@ -321,20 +337,121 @@ def extract_jsons_from_zip(uploaded_file) -> list[dict]:
     return results
 
 
-def flatten_chat(chat: dict, max_chars: int = 600) -> str:
-    """Flatten a tawk.to chat dict to a compact readable string."""
+def flatten_chat(chat: dict, max_chars: int = 800) -> str:
+    """Flatten a tawk.to chat dict to a compact, readable string.
+
+    Properly handles tawk.to's sender format: {t: "a"|"v"|"s", n: "Name"}
+    Includes visitor metadata (location, email) for better context.
+    """
     lines = []
-    if chat.get("id"):
-        lines.append(f"[{chat['id']}]")
+
+    # Header: visitor info + location
+    visitor = chat.get("visitor", {})
+    vname = visitor.get("name", "")
+    vemail = visitor.get("email", "")
+    loc = chat.get("location", {})
+    country = loc.get("countryCode", "")
+    city = loc.get("city", "")
+    domain = chat.get("domain", "")
+
+    header_parts = []
+    if vname:
+        header_parts.append(vname)
+    if vemail:
+        header_parts.append(f"<{vemail}>")
+    if city or country:
+        header_parts.append(f"[{city}, {country}]")
+    if domain:
+        header_parts.append(f"@{domain}")
+    if header_parts:
+        lines.append(" ".join(header_parts))
+
+    # Messages — properly parsed
     messages = chat.get("messages", chat.get("conversation", []))
     for msg in messages:
-        sender = msg.get("name") or msg.get("sender") or msg.get("type", "?")
-        text = msg.get("msg") or msg.get("message") or msg.get("text", "")
+        sender = _sender_label(msg)
+        text = _msg_text(msg)
         if text:
-            lines.append(f"{sender}: {text[:200]}")
+            # Truncate individual messages but keep enough context
+            lines.append(f"{sender}: {text[:250]}")
+
     if len(lines) <= 1:
+        # Fallback: dump raw JSON
         lines.append(json.dumps(chat, ensure_ascii=False)[:max_chars])
+
     return "\n".join(lines)[:max_chars]
+
+
+def filter_chats(chats: list[dict], min_msgs: int = 2) -> list[dict]:
+    """Filter out empty/very-short chats and deduplicate by chat ID."""
+    seen = set()
+    filtered = []
+    for c in chats:
+        chat_id = c.get("id", "")
+        if chat_id in seen:
+            continue
+        messages = c.get("messages", c.get("conversation", []))
+        # Skip chats with too few messages
+        if len(messages) < min_msgs:
+            continue
+        # Skip chats that are only system/agent messages (no visitor input)
+        has_visitor = any(
+            (m.get("sender", {}).get("t") if isinstance(m.get("sender"), dict) else None) == "v"
+            for m in messages
+        )
+        if not has_visitor:
+            continue
+        seen.add(chat_id)
+        filtered.append(c)
+    return filtered
+
+
+def sample_diverse(chats: list[dict], n: int) -> list[dict]:
+    """Sample chats with diversity: prefer longer chats and different visitors.
+
+    Ensures the AI sees substantive conversations, not just "hi" / "hello".
+    """
+    if len(chats) <= n:
+        return chats
+
+    # Score chats by message count (prefer richer conversations)
+    scored = []
+    for c in chats:
+        msg_count = len(c.get("messages", c.get("conversation", [])))
+        country = c.get("location", {}).get("countryCode", "??")
+        scored.append((c, msg_count, country))
+
+    # Sort by message count descending, take top 60% for quality
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top_pool = scored[:int(len(scored) * 0.6)]
+
+    # Deduplicate by country to get geographic diversity
+    by_country = {}
+    for item in top_pool:
+        cc = item[2]
+        by_country.setdefault(cc, []).append(item)
+
+    # Fill quota: round-robin across countries, then fill remaining
+    selected = []
+    countries = list(by_country.keys())
+    random.shuffle(countries)
+    ci = 0
+    while len(selected) < n and countries:
+        cc = countries[ci % len(countries)]
+        pool = by_country[cc]
+        if pool:
+            selected.append(pool.pop(0))
+        if not pool:
+            countries.remove(cc)
+        ci += 1
+
+    # If still short, fill from remaining top pool
+    remaining = [x for x in top_pool if x not in selected]
+    random.shuffle(remaining)
+    while len(selected) < n and remaining:
+        selected.append(remaining.pop(0))
+
+    return [item[0] for item in selected[:n]]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -342,16 +459,16 @@ def flatten_chat(chat: dict, max_chars: int = 600) -> str:
 # ═══════════════════════════════════════════════════════════════
 
 def build_schema_prompt(chat_samples: list[str]) -> str:
-    trimmed = [s[:500] for s in chat_samples]
+    trimmed = [s[:600] for s in chat_samples]
     sample_block = "\n---\n".join(trimmed)[:80_000]
-    return f"""You are an expert customer support analyst at HostAfrica (web hosting company).
-Analyse the support chat sample below and produce a CLEAN, DATA-DRIVEN categorisation schema.
+    return f"""You are an expert customer support analyst. Analyse the support chat sample below and produce a CLEAN, DATA-DRIVEN categorisation schema.
 
 RULES:
 1. Categories = genuine customer problems ONLY. NOT internal procedures.
    - Support PIN / security PIN = routine auth step performed at the start of almost every chat.
      It is NOT a customer issue. Do NOT create a category for it.
    - No categories for greetings, farewells, or scripted agent steps.
+   - No categories for "transferring to agent" or queue/waiting messages.
 2. 10–20 categories max. Merge thin or overlapping ones.
 3. Each category must have:
    - "name": short clear title (e.g. "Email Delivery Failures")
@@ -362,7 +479,7 @@ RULES:
 4. Include a "meta" object with:
    - "schema_version": "1.0"
    - "derived_from_sample_size": {len(chat_samples)}
-   - "analyst_notes": paragraph on dominant patterns and what the old keyword approach got wrong
+   - "analyst_notes": paragraph on dominant patterns observed
 
 Return ONLY valid JSON with keys "categories" and "meta". No markdown, no preamble.
 
@@ -372,9 +489,9 @@ Return ONLY valid JSON with keys "categories" and "meta". No markdown, no preamb
 
 def build_batch_relabel_prompt(schema: dict, chat_batch: list[tuple[int, str]]) -> str:
     """Classify multiple chats in one API call — ~80% cheaper than one-per-chat."""
-    categories = [c["name"] for c in schema.get("categories", [])] + ["General"]
+    categories = [c["name"] for c in schema.get("categories", [])] + ["General / Other"]
     cat_list = "\n".join(f"- {c}" for c in categories)
-    chats_block = "\n".join(f"[CHAT_{idx}]\n{text[:400]}" for idx, text in chat_batch)
+    chats_block = "\n".join(f"[CHAT_{idx}]\n{text[:500]}" for idx, text in chat_batch)
 
     return f"""Classify each chat below using ONLY these categories:
 {cat_list}
@@ -391,7 +508,12 @@ Return ONLY a valid JSON array. No preamble, no markdown.
 # TABS
 # ═══════════════════════════════════════════════════════════════
 
-tab1, tab2, tab3 = st.tabs(["📤 Upload & Extract", "🧠 Build Schema", "🏷️ Re-label Chats"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📤 Upload & Extract",
+    "🧠 Build Schema",
+    "🏷️ Re-label Chats",
+    "📈 Analytics",
+])
 
 
 # ──────────────────────────────────────────────────────────────
@@ -408,26 +530,38 @@ with tab1:
 
     if uploaded:
         with st.spinner("🔍 Unpacking ZIPs and reading JSON files…"):
-            chats = extract_jsons_from_zip(uploaded)
+            raw_chats = extract_jsons_from_zip(uploaded)
 
-        if not chats:
+        if not raw_chats:
             st.error("No JSON chat records found. Double-check the ZIP structure.")
         else:
+            # Filter out junk chats
+            chats = filter_chats(raw_chats, min_msgs=min_messages)
             st.session_state["chats"] = chats
-            msg_count = sum(len(c.get("messages", c.get("conversation", []))) for c in chats)
-            agents = {
-                m.get("name", "")
-                for c in chats
-                for m in c.get("messages", c.get("conversation", []))
-                if m.get("type") in ("agent", "staff")
-            }
+            st.session_state["raw_count"] = len(raw_chats)
 
-            col1, col2, col3, col4 = st.columns(4)
+            # Stats
+            msg_count = sum(len(c.get("messages", c.get("conversation", []))) for c in chats)
+            agents = set()
+            countries = set()
+            for c in chats:
+                loc = c.get("location", {})
+                if loc.get("countryCode"):
+                    countries.add(loc["countryCode"])
+                for m in c.get("messages", c.get("conversation", [])):
+                    sender = m.get("sender", {})
+                    if isinstance(sender, dict) and sender.get("t") == "a":
+                        name = sender.get("n", "")
+                        if name:
+                            agents.add(name)
+
+            col1, col2, col3, col4, col5 = st.columns(5)
             for col, val, lbl in [
-                (col1, f"{len(chats):,}", "Chats Found"),
-                (col2, f"{msg_count:,}", "Total Messages"),
-                (col3, str(len(agents)), "Agents Detected"),
-                (col4, str(min(sample_size, len(chats))), "Analysis Sample"),
+                (col1, f"{len(raw_chats):,}", "Raw Chats"),
+                (col2, f"{len(chats):,}", "After Filter"),
+                (col3, f"{msg_count:,}", "Total Messages"),
+                (col4, str(len(agents)), "Agents"),
+                (col5, str(len(countries)), "Countries"),
             ]:
                 with col:
                     st.markdown(
@@ -436,11 +570,24 @@ with tab1:
                         unsafe_allow_html=True
                     )
 
-            st.success(f"✅ Extracted **{len(chats):,}** chat records. Head to **Build Schema**.")
+            if len(raw_chats) != len(chats):
+                st.info(
+                    f"ℹ️ Filtered out {len(raw_chats) - len(chats)} chats "
+                    f"(< {min_messages} messages or no visitor input)."
+                )
 
-            with st.expander("👁️ Preview first 3 chats (raw JSON)"):
+            st.success(f"✅ Extracted **{len(chats):,}** usable chat records. Head to **Build Schema**.")
+
+            # Country distribution
+            country_counts = Counter(c.get("location", {}).get("countryCode", "??") for c in chats)
+            if country_counts:
+                st.markdown("##### 🌍 Geographic Distribution")
+                cc_df = pd.DataFrame(country_counts.most_common(15), columns=["Country", "Chats"])
+                st.bar_chart(cc_df.set_index("Country"))
+
+            with st.expander("👁️ Preview first 3 chats"):
                 for c in chats[:3]:
-                    st.json(c, expanded=False)
+                    st.code(flatten_chat(c), language=None)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -457,11 +604,11 @@ with tab2:
         chats = st.session_state["chats"]
         n = min(sample_size, len(chats))
 
-        # Live cost estimate
-        sample_preview = random.sample(chats, n)
+        # Cost estimate
+        sample_preview = sample_diverse(chats, n)
         flat_preview = [flatten_chat(c) for c in sample_preview]
         prompt_preview = build_schema_prompt(flat_preview)
-        est_in  = estimate_tokens(prompt_preview)
+        est_in = estimate_tokens(prompt_preview)
         est_out = 3000
         est_cost = estimate_cost(est_in, est_out, model_name)
 
@@ -476,7 +623,7 @@ with tab2:
             st.markdown(f'<div class="cost-box"><div class="cost-val">{format_cost(est_cost)}</div>'
                         f'<div class="cost-lbl">Estimated cost (USD)</div></div>', unsafe_allow_html=True)
 
-        st.caption(f"Using **{provider} · {model_name}**. Adjust sample size in the sidebar to control cost.")
+        st.caption(f"Using **{provider} · {model_name}**. Adjust sample size in the sidebar.")
         st.markdown("---")
 
         if st.button("🚀 Build Schema", type="primary", use_container_width=True):
@@ -586,13 +733,13 @@ with tab3:
             min_value=5, max_value=min(500, len(chats)), value=min(100, len(chats))
         )
 
-        # Batched cost estimate
+        # Cost estimate
         n_batches = math.ceil(relabel_count / BATCH_SIZE)
         sample_rl = random.sample(chats, min(BATCH_SIZE, relabel_count))
         flat_rl = [(i, flatten_chat(c)) for i, c in enumerate(sample_rl)]
         batch_ex = build_batch_relabel_prompt(schema, flat_rl)
         tpb = estimate_tokens(batch_ex)
-        total_in  = tpb * n_batches
+        total_in = tpb * n_batches
         total_out = 150 * n_batches
         cost_rl = estimate_cost(total_in, total_out, model_name)
 
@@ -611,7 +758,8 @@ with tab3:
         st.caption(f"✅ Batching {BATCH_SIZE} chats per call — ~80% cheaper than one-per-chat.")
 
         if st.button("🏷️ Re-label Chats", type="primary", use_container_width=True):
-            sample = random.sample(chats, relabel_count)
+            # Use diverse sampling for relabelling too
+            sample = sample_diverse(chats, relabel_count)
             indexed = [(i, flatten_chat(c)) for i, c in enumerate(sample)]
             batches = [indexed[i:i + BATCH_SIZE] for i in range(0, len(indexed), BATCH_SIZE)]
 
@@ -625,7 +773,6 @@ with tab3:
                     f"Batch {b_idx+1}/{len(batches)} — classifying {len(batch)} chats…"
                 )
                 prompt = build_batch_relabel_prompt(schema, batch)
-                raw_clean = ""
                 try:
                     raw = call_ai(prompt, max_tokens=1024, temperature=0.1)
                     raw_clean = raw.strip()
@@ -635,7 +782,7 @@ with tab3:
 
                     batch_results = json.loads(raw_clean)
 
-                    # Unwrap if model returned {"results": [...]} instead of [...]
+                    # Unwrap if model returned {"results": [...]}
                     if isinstance(batch_results, dict):
                         batch_results = next(
                             (v for v in batch_results.values() if isinstance(v, list)), []
@@ -645,8 +792,11 @@ with tab3:
                         orig_idx = item.get("id", 0)
                         if 0 <= orig_idx < len(batch):
                             chat_obj = sample[batch[orig_idx][0]]
+                            visitor = chat_obj.get("visitor", {})
                             results.append({
                                 "chat_id":    chat_obj.get("id", batch[orig_idx][0]),
+                                "visitor":    visitor.get("name", ""),
+                                "country":    chat_obj.get("location", {}).get("countryCode", ""),
                                 "category":   item.get("category", "General"),
                                 "confidence": round(float(item.get("confidence", 0)), 2),
                                 "reason":     item.get("reason", ""),
@@ -661,9 +811,9 @@ with tab3:
                         unsafe_allow_html=True
                     )
                     if "quota" in str(e).lower() or "insufficient" in str(e).lower():
-                        break  # stop if quota is exhausted
+                        break
 
-                # Groq & Gemini benefit from a small pause between batches
+                # Rate limit courtesy
                 if provider in ("Gemini", "Groq"):
                     time.sleep(0.4)
 
@@ -686,12 +836,22 @@ with tab3:
             )
             cat_counts.columns = ["Category", "Count"]
 
-            st.markdown("#### Distribution of Re-labelled Chats")
+            st.markdown("#### Distribution")
             st.bar_chart(cat_counts.set_index("Category"))
+
+            # Confidence stats
+            if "confidence" in df.columns:
+                avg_conf = df["confidence"].mean()
+                low_conf = (df["confidence"] < 0.5).sum()
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Avg Confidence", f"{avg_conf:.2f}")
+                with col2:
+                    st.metric("Low Confidence (<0.5)", low_conf)
 
             st.markdown("#### Re-labelled Records")
             st.dataframe(
-                df[["chat_id", "category", "confidence", "reason", "preview"]],
+                df[["chat_id", "visitor", "country", "category", "confidence", "reason", "preview"]],
                 use_container_width=True,
                 hide_index=True,
             )
@@ -703,3 +863,56 @@ with tab3:
                 mime="text/csv",
                 use_container_width=True,
             )
+
+
+# ──────────────────────────────────────────────────────────────
+# TAB 4 — Analytics
+# ──────────────────────────────────────────────────────────────
+with tab4:
+    st.markdown('<div class="sec-header">Chat data analytics</div>', unsafe_allow_html=True)
+
+    if "chats" not in st.session_state:
+        st.info("Upload a ZIP first to see analytics.")
+    else:
+        chats = st.session_state["chats"]
+
+        # ── Message length distribution ──
+        st.markdown("##### 💬 Messages per Chat")
+        msg_lens = [len(c.get("messages", c.get("conversation", []))) for c in chats]
+        hist_df = pd.DataFrame({"messages": msg_lens})
+        st.bar_chart(hist_df["messages"].value_counts().sort_index().head(30))
+
+        # ── Chat duration (if available) ──
+        durations = [c.get("chatDuration", 0) for c in chats if c.get("chatDuration", 0) > 0]
+        if durations:
+            st.markdown("##### ⏱️ Chat Duration (seconds)")
+            dur_df = pd.DataFrame({"duration_s": durations})
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Median", f"{int(dur_df['duration_s'].median())}s")
+            with col2:
+                st.metric("Mean", f"{int(dur_df['duration_s'].mean())}s")
+            with col3:
+                st.metric("Max", f"{int(dur_df['duration_s'].max())}s")
+
+        # ── Country breakdown ──
+        st.markdown("##### 🌍 Chats by Country")
+        country_counts = Counter(c.get("location", {}).get("countryCode", "??") for c in chats)
+        cc_df = pd.DataFrame(country_counts.most_common(20), columns=["Country", "Chats"])
+        st.bar_chart(cc_df.set_index("Country"))
+
+        # ── Domain breakdown ──
+        domains = Counter(c.get("domain", "unknown") for c in chats)
+        if len(domains) > 1:
+            st.markdown("##### 🌐 Chats by Domain")
+            dom_df = pd.DataFrame(domains.most_common(15), columns=["Domain", "Chats"])
+            st.bar_chart(dom_df.set_index("Domain"))
+
+        # ── Re-labelled analytics ──
+        if "relabelled" in st.session_state:
+            st.markdown("---")
+            st.markdown("##### 🏷️ Category × Country Cross-tab")
+            rdf = pd.DataFrame(st.session_state["relabelled"])
+            if "country" in rdf.columns:
+                cross = pd.crosstab(rdf["category"], rdf["country"])
+                st.dataframe(cross, use_container_width=True)
